@@ -1,0 +1,226 @@
+#define FPS 24
+#define MJPEG_BUFFER_SIZE (160 * 128 * 2 / 4)
+
+#include <WiFi.h>
+#include <SD.h>
+#include <driver/i2s.h>
+
+/* IO Pin Definitions */
+int SD_MISO = 12;
+int SD_SCK = 14;
+int SD_MOSI = 13;
+int SD_CS = 4;
+int LCD_SCK = 18;
+int LCD_MISO = 19;
+int LCD_MOSI = 23;
+int LCD_DC_A0 = 27;
+int LCD_RESET = 33;
+int LCD_CS = 5;
+
+int BTN_ONE = 21;
+int BTN_TWO = 15;
+
+bool BtnOnePressed = false;
+bool BtnTwoPressed = false;
+
+String videoFilename ;
+String FileButton = "none";
+
+
+/* Arduino_GFX */
+#include <Arduino_GFX_Library.h>
+Arduino_ESP32SPI *bus = new Arduino_ESP32SPI(LCD_DC_A0 /* DC */, LCD_CS /* CS */, LCD_SCK /* SCK */, LCD_MOSI /* MOSI */, LCD_MISO /* MISO */);
+/* NOTE - IF RED AND BLUE COLORS ARE SWAPPED, FLIP bool bgr in below constructor. */
+Arduino_GFX *gfx = new Arduino_ST7735(bus, LCD_RESET /* RST */, 3 /* rotation */, false /* IPS */, ST7735_TFTWIDTH /* w*/, ST7735_TFTHEIGHT /* h*/,
+                                      0 /* col_offset1 */, 0 /* row_offset1 */, 0 /* col_offset2 */, 0 /* row_offset2 */, false /* bgr */);
+
+/* MJPEG Video */
+#include "MjpegClass.h"
+static MjpegClass mjpeg;
+
+bool buttonPressed = false;
+static unsigned long total_show_video = 0;
+
+File root;
+
+void IRAM_ATTR VideoOne()
+{
+  buttonPressed = true;
+  if (BtnOnePressed == false)
+  {
+    FileButton = "/Vid01.mjpeg";
+    BtnOnePressed = true;
+    BtnTwoPressed = false;
+  }
+  else
+  {
+    BtnOnePressed = false;
+    FileButton = "none";
+    BtnTwoPressed = false; 
+  }
+}
+
+void IRAM_ATTR VideoTwo()
+{
+  buttonPressed = true;
+ if (BtnTwoPressed == false)
+ { 
+   FileButton = "/Vid02.mjpeg";
+   BtnTwoPressed = true;
+   BtnOnePressed = false;   
+ }
+else
+{
+  FileButton = "none";
+  BtnTwoPressed = false; 
+  BtnOnePressed = false; 
+}
+}
+
+
+
+void setup()
+{
+  WiFi.mode(WIFI_OFF);
+  Serial.begin(115200);
+
+  pinMode(BTN_ONE, INPUT_PULLUP);
+  pinMode(BTN_TWO, INPUT_PULLUP);
+
+  /*pinMode(BTN_Three, INPUT_PULLUP);*/
+
+  attachInterrupt(BTN_ONE, VideoOne, RISING);
+  attachInterrupt(BTN_TWO, VideoTwo, RISING);
+
+  // Init Video
+  gfx->begin();
+  gfx->fillScreen(BLACK);
+
+  SPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (!SD.begin(SD_CS,SPI,40000000))
+  {
+    Serial.println(F("ERROR: SD card mount failed!"));
+    gfx->println(F("ERROR: SD card mount failed!"));
+  }
+  else
+  {
+    root = SD.open("/");
+    Serial.print("Found ");
+    Serial.println(" in root directory!");
+    Serial.println("Starting playback!");
+  }
+
+}
+
+void GetFileName(String FileButton)
+{
+videoFilename  = FileButton;
+}
+
+
+void playVideo(String videoFilename)
+{
+  int next_frame = 0;
+  int skipped_frames = 0;
+  unsigned long total_play_audio = 0;
+  unsigned long total_read_video = 0;
+  unsigned long total_decode_video = 0;
+  unsigned long start_ms, curr_ms, next_frame_ms;
+
+  int brightPWM = 0;
+
+  Serial.println("In playVideo() loop!");
+
+
+
+  File vFile = SD.open(videoFilename.c_str());
+  Serial.println("Created vFile!");
+  
+  
+
+  uint8_t *mjpeg_buf = (uint8_t *)malloc(MJPEG_BUFFER_SIZE);
+  if (!mjpeg_buf)
+  {
+    Serial.println(F("mjpeg_buf malloc failed!"));
+  }
+  else
+  {
+    // init Video
+    mjpeg.setup(&vFile, mjpeg_buf, drawMCU, false, true); //MJPEG SETUP -> bool setup(Stream *input, uint8_t *mjpeg_buf, JPEG_DRAW_CALLBACK *pfnDraw, bool enableMultiTask, bool useBigEndian)
+  }
+
+if (videoFilename != "none")
+{
+
+  if (!vFile || vFile.isDirectory())
+  {
+    Serial.println(("ERROR: Failed to open "+ videoFilename +".mjpeg file for reading"));
+    gfx->println(("ERROR: Failed to open "+ videoFilename +".mjpeg file for reading"));
+  }
+  else
+  {
+    start_ms = millis();
+    curr_ms = start_ms;
+    next_frame_ms = start_ms + (++next_frame * 1000 / FPS);    
+    
+   while (vFile.available() && buttonPressed == false)
+    {
+      // Read video
+      mjpeg.readMjpegBuf();
+      total_read_video += millis() - curr_ms;
+      curr_ms = millis();
+      if (millis() < next_frame_ms) // check show frame or skip frame
+      {
+        // Play video
+        mjpeg.drawJpg();
+        total_decode_video += millis() - curr_ms;
+      }
+      else
+      {
+        ++skipped_frames;
+        Serial.println(F("Skip frame"));
+      }
+      curr_ms = millis();
+      
+
+      
+      while (millis() < next_frame_ms)
+      {
+        vTaskDelay(1);
+      }
+      curr_ms = millis();
+      next_frame_ms = start_ms + (++next_frame * 1000 / FPS);
+    }
+    
+    
+    vFile.close();
+  
+  }
+  buttonPressed = false;
+  if (mjpeg_buf)
+  {
+    free(mjpeg_buf);
+  }
+}
+else
+{
+gfx->fillScreen(BLACK);
+}
+}
+
+
+static int drawMCU(JPEGDRAW *pDraw)
+{
+  unsigned long s = millis();
+  gfx->draw16bitBeRGBBitmap(pDraw->x, pDraw->y, pDraw->pPixels, pDraw->iWidth, pDraw->iHeight);
+  total_show_video += millis() - s;
+  return 1;
+}
+
+void loop()
+{
+ root = SD.open("/");
+ GetFileName(FileButton);
+ playVideo(videoFilename);
+
+}
